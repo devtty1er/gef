@@ -7133,6 +7133,79 @@ class ElfInfoCommand(GenericCommand):
         return
 
 
+class ReloadSymbolsOnRetBreakpoint(gdb.Breakpoint):
+    """Dynamically set a ReloadSymbolsBreakpoint at the procedure's return address"""
+    def __init__(self, spec):
+        arch = get_arch()
+        if not arch.startswith("i386"):
+            raise OSError("ReloadSymbolsOnCallBreakpoint does not support architecture: {}".format(arch))
+        super(ReloadSymbolsOnRetBreakpoint, self).__init__(spec, type=gdb.BP_BREAKPOINT, temporary=True)
+        return
+
+    def stop(self):
+        arch = get_arch()
+        if arch.startswith("i386:x86-64"):
+            ret_addr = gdb.parse_and_eval('*(int*)($rbp + 8)')
+        elif arch.startswith("i386"):  # TODO: Reconcile difference with i386-x
+            ret_addr = gdb.parse_and_eval('*(int*)($ebp + 4)')
+        else:
+            err('Unexpected architecture: {}'.format(arch))
+            return True
+        ReloadSymbolsBreakpoint('*{}'.format(ret_addr))
+        return False
+
+
+class ReloadSymbolsBreakpoint(gdb.Breakpoint):
+    """Run reload-symbols when the breakpoint is hit"""
+    def __init__(self, spec):
+        super(ReloadSymbolsBreakpoint, self).__init__(spec, type=gdb.BP_BREAKPOINT, temporary=True)
+        return
+
+    def stop(self):
+        gdb.execute("reload-symbols")
+        return False
+
+
+@register_command
+class WineBreakCommand(GenericCommand):
+    """Add temporary breakpoints to Wine binaries that notify gdb of newly loaded
+    objects for which symbols are missing. These breakpoints only work for Wine
+    compiled with `CPPFLAGS='-ggdb'` Tested on Wine version 5.1.
+    """
+
+    _cmdline_ = "wine-break"
+    _syntax_  = _cmdline_
+
+    def __init__(self, *args, **kwargs):
+        super(WineBreakCommand, self).__init__()
+        return
+
+    def do_invoke(self, argv):
+        fname = get_filename()
+        if not fname.endswith("wine"):
+            warn("gdb wine or (gdb) file wine first!")
+            return
+        # Pending breakpoints are required
+        gdb.execute("set breakpoint pending on")
+        ReloadSymbolsOnRetBreakpoint("wld_start")   # wine loaded (by wine-preloader)
+        ReloadSymbolsBreakpoint("wine_init")        # libwine.so loaded
+        ReloadSymbolsOnRetBreakpoint("wine_dlsym")  # ntdll.dll.so loaded
+        ReloadSymbolsBreakpoint("set_cpu_context")  # kernel32.dll.so loaded
+        class StartProcessBreakpoint(gdb.Breakpoint):
+            """Continue from Wine's start_process to the entry itself"""
+            def __init__(self):
+                super(StartProcessBreakpoint, self).__init__("start_process", type=gdb.BP_BREAKPOINT, temporary=True)
+                return
+
+            def stop(self):
+                gdb.execute("tb *(entry)")
+                return False
+
+        StartProcessBreakpoint()
+        gdb.execute("run {}".format(" ".join(argv)))
+        return
+
+
 @register_command
 class EntryPointBreakCommand(GenericCommand):
     """Tries to find best entry point and sets a temporary breakpoint on it. The command will test for
@@ -7277,6 +7350,8 @@ class ContextCommand(GenericCommand):
 
         if "capstone" in list(sys.modules.keys()):
             self.add_setting("use_capstone", False, "Use capstone as disassembler in the code pane (instead of GDB)")
+        if "elftools" in list(sys.modules.keys()):
+            self.add_setting("wine-break", False, "Follow Wine loaders and break on exe entry")
 
         self.layout_mapping = {
             "legend":  self.show_legend,
@@ -8353,6 +8428,46 @@ class ResetCacheCommand(GenericCommand):
 
     def do_invoke(self, argv):
         reset_all_caches()
+        return
+
+
+@register_command
+class ReloadSymbolsCommand(GenericCommand):
+    ''' Description
+    '''
+
+    _cmdline_ = "reload-symbols"
+    _syntax_ = _cmdline_
+
+    def __init__(self):
+        super(ReloadSymbolsCommand, self).__init__(complete=gdb.COMPLETE_LOCATION)
+        return
+
+    def pre_load(self):
+        try:
+            __import__("elftools.elf.elffile")
+        except ImportError:
+            msg = "Missing `elftools` package for Python{0}, install with: `pip{0} install pyelftools`.".format(PYTHON_MAJOR)
+            raise ImportWarning(msg)
+        return
+
+
+    @only_if_gdb_running
+    def do_invoke(self, argv):
+        ELFFile = sys.modules["elftools.elf.elffile"].ELFFile
+        vmmap = get_process_maps()
+        for entry in vmmap:
+            if (entry.permission & Permission.EXECUTE) and os.path.exists(entry.path):
+                text_offset = 0
+                with open(entry.path, "rb") as f:
+                    elf = ELFFile(f)
+                    for section in elf.iter_sections():
+                        if section.name == ".text":
+                           text_offset = section["sh_addr"]
+                if text_offset < entry.page_start:
+                    text_offset += entry.page_start
+                cmd = "add-symbol-file {:s} 0x{:x}".format(entry.path, text_offset)
+                gdb.execute(cmd, to_string=True)
         return
 
 
