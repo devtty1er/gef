@@ -7132,6 +7132,54 @@ class ElfInfoCommand(GenericCommand):
             gef_print("{}: {}".format(Color.boldify("{:<22}".format(title)), content))
         return
 
+call_stack = []
+breakpoints = []
+
+class TraceFunctionBreakpoint(gdb.Breakpoint):
+    def __init__(self, spec, basic_blocks, callback=None):
+        self.basic_blocks = basic_blocks
+        super(TraceFunctionBreakpoint, self).__init__(spec, type=gdb.BP_BREAKPOINT, temporary=True)
+        return
+
+    def stop(self):
+        bps = []
+        for basic_block in self.basic_blocks:
+            bps.append(TraceBasicBlockBreakpoint('*0x{:02x}'.format(basic_block), callback))
+        arch = get_arch()
+        if arch.startswith("i386:x86-64"):
+            ret_addr = gdb.parse_and_eval('*(int*)($rbp + 8)')
+        elif arch.startswith("i386"):  # TODO: Reconcile difference with i386-x
+            ret_addr = gdb.parse_and_eval('*(int*)($ebp + 4)')
+        else:
+            err('Unexpected architecture: {}'.format(arch))
+            return True
+        TraceFunctionCleanupBreakpoint('*{}'.format(ret_addr), bps)
+        return False
+
+
+class TraceFunctionCleanupBreakpoint(gdb.Breakpoint):
+    def __init__(self, spec, bps):
+        self.bps = bps
+        super(TraceFunctionCleanupBreakpoint, self).__init__(spec, type=gdb.BP_BREAKPOINT, temporary=True)
+        return
+
+    def stop(self):
+        for bp in self.bps:
+            bp.delete()
+        self.delete()
+
+
+class TraceBasicBlockBreakpoint(gdb.Breakpoint):
+    def __init__(self, spec, callback):
+        arch = get_arch()
+        if not arch.startswith("i386"):
+            raise OSError("ReloadSymbolsOnCallBreakpoint does not support architecture: {}".format(arch))
+        super(ReloadSymbolsOnRetBreakpoint, self).__init__(spec, type=gdb.BP_BREAKPOINT, temporary=True)
+        return
+
+    def stop(self):
+        return callback(self)
+
 
 class ReloadSymbolsOnRetBreakpoint(gdb.Breakpoint):
     """Dynamically set a ReloadSymbolsBreakpoint at the procedure's return address"""
